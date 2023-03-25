@@ -240,7 +240,23 @@ class HttpClient(QuicConnectionProtocol):
         self._request_waiter[stream_id] = waiter
         self.transmit()
 
-        return await asyncio.shield(waiter)
+        return await waiter
+    
+async def generate_requests():
+
+    start = time.monotonic()
+    total = 60
+    elapsed = 0
+    idx = 0
+
+    while elapsed < total:
+        yield idx
+
+        idx += 1
+
+        await asyncio.sleep(0)
+
+        elapsed = time.monotonic() - start
 
 
 async def perform_http_request(
@@ -250,43 +266,56 @@ async def perform_http_request(
     include: bool,
     output_dir: Optional[str],
 ) -> None:
-    # perform request
-    start = time.time()
-    if data is not None:
+    
+    data_bytes  = None
+
+    if data:
         data_bytes = data.encode()
-        http_events = await client.post(
-            url,
-            data=data_bytes,
-            headers={
-                "content-length": str(len(data_bytes)),
-                "content-type": "application/x-www-form-urlencoded",
-            },
-        )
-        method = "POST"
+    # perform request
+    start = time.monotonic()
+    if data is not None:
+        http_events, pending = await asyncio.wait([
+            asyncio.create_task(
+                client.post(
+                    url,
+                    data=data_bytes,
+                    headers={
+                        "content-length": str(len(data_bytes)),
+                        "content-type": "application/x-www-form-urlencoded",
+                    },
+                )
+            ) async for _ in generate_requests()
+        ])
+
     else:
-        http_events = await client.get(url)
-        method = "GET"
-    elapsed = time.time() - start
+        http_events, pending = await asyncio.wait([
+            asyncio.create_task(
+                client.get(url)
+            ) async for _ in generate_requests()
+        ], timeout=1)
 
-    # print speed
-    octets = 0
-    for http_event in http_events:
-        if isinstance(http_event, DataReceived):
-            octets += len(http_event.data)
-    logger.info(
-        "Response received for %s %s : %d bytes in %.1f s (%.3f Mbps)"
-        % (method, urlparse(url).path, octets, elapsed, octets * 8 / elapsed / 1000000)
-    )
 
-    # output response
-    if output_dir is not None:
-        output_path = os.path.join(
-            output_dir, os.path.basename(urlparse(url).path) or "index.html"
-        )
-        with open(output_path, "wb") as output_file:
-            write_response(
-                http_events=http_events, include=include, output_file=output_file
-            )
+    elapsed = time.monotonic() - start
+    results = await asyncio.gather(*http_events)
+
+    print('Completed: ', len(results), 'in', elapsed, 'seconds')
+
+    try:
+        for pend in pending:
+            try:
+                pend.cancel()
+
+                if pend.cancelled() is False:
+                    await pend
+
+            except Exception:
+                pass
+    
+    except Exception:
+        pass
+
+
+    print('Completed: ', len(results))
 
 
 def process_http_pushes(
@@ -411,17 +440,14 @@ async def main(
             await ws.close()
         else:
             # perform request
-            coros = [
-                perform_http_request(
+            for url in urls:
+                await perform_http_request(
                     client=client,
                     url=url,
                     data=data,
                     include=include,
                     output_dir=output_dir,
                 )
-                for url in urls
-            ]
-            await asyncio.gather(*coros)
 
             # process http pushes
             process_http_pushes(client=client, include=include, output_dir=output_dir)
